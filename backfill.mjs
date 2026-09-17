@@ -33,13 +33,16 @@
  *   --path=/some/dir       also search here
  *   --quick                skip reading the files (sizes and dates only)
  *   --json                 machine-readable scan output
+ *   --login                sign in with your own Google account, in your browser
+ *   --logout               forget the saved sign-in on this Mac
  *   --whoami               check the login and print who the server thinks you are
  *   --yes                  don't ask before uploading
  *   --delay-ms=750         pause between uploads
  *
- * Auth, when you --send: the script reuses the VG Brain login already cached on
- * this Mac by the connector (~/.mcp-auth). If there isn't one, set a token that
- * Liam mints for you:  export VG_BRAIN_TOKEN=...
+ * Signing in: run `node backfill.mjs --login` and a browser opens. Sign in with
+ * the same Google account you use for VG Brain and you're done — the sign-in is
+ * saved on this Mac. If you've already installed the VG Brain connector, the
+ * script finds that login on its own and you can skip even this.
  *
  * Node 18 or newer. No install, no dependencies.
  */
@@ -52,7 +55,10 @@ import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { request as httpsRequest } from "node:https";
-import { request as httpRequest } from "node:http";
+import { request as httpRequest, createServer } from "node:http";
+import { spawn } from "node:child_process";
+import { randomBytes, createHash as sha256 } from "node:crypto";
+import { writeFileSync, chmodSync, unlinkSync } from "node:fs";
 
 // --- arguments -------------------------------------------------------------
 
@@ -469,11 +475,241 @@ function resolveToken() {
   const rawEnv = String(process.env.VG_BRAIN_TOKEN || "");
   const env = rawEnv.trim();
   if (env) return { token: env, from: "the VG_BRAIN_TOKEN environment variable", minted: true };
+  const saved = savedLogin();
+  if (saved) return saved;
   const cached = cachedToken();
   return cached ? { ...cached, minted: false } : null;
 }
 
 // --- http ------------------------------------------------------------------
+
+// --- signing in ------------------------------------------------------------
+//
+// The whole point is that nobody has to be handed a secret. VG Brain speaks
+// OAuth 2.1 with dynamic client registration and PKCE, so this script can
+// register itself, bounce you through your own browser, and catch the
+// authorization code on a loopback port. Same handshake the connector does.
+// Nothing is emailed, nothing is pasted, and the operator is not involved.
+
+const LOGIN_FILE = join(HOME, ".vg-brain-backfill.json");
+
+function savedLogin() {
+  try {
+    const j = JSON.parse(readFileSync(LOGIN_FILE, "utf8"));
+    if (typeof j?.access_token !== "string" || !j.access_token) return null;
+    if (j.base && j.base !== BASE) return null; // a login for a different server
+    if (typeof j.expires_at === "number" && Date.now() > j.expires_at) return null;
+    return { token: j.access_token, from: `your saved sign-in (${LOGIN_FILE.replace(HOME, "~")})`, minted: false };
+  } catch {
+    return null;
+  }
+}
+
+function saveLogin(token, expiresIn) {
+  try {
+    writeFileSync(LOGIN_FILE, JSON.stringify({
+      base: BASE,
+      access_token: token,
+      expires_at: Number.isFinite(expiresIn) ? Date.now() + expiresIn * 1000 : null,
+      saved_at: new Date().toISOString(),
+    }, null, 2));
+    chmodSync(LOGIN_FILE, 0o600);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function postForm(url, fields) {
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(url); } catch { resolve({ status: 0, error: "bad url" }); return; }
+    const payload = Buffer.from(new URLSearchParams(fields).toString(), "utf8");
+    const lib = u.protocol === "http:" ? httpRequest : httpsRequest;
+    const req = lib(u, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": payload.length,
+        Accept: "application/json",
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => { data += c; });
+      res.on("end", () => {
+        let parsed = null;
+        try { parsed = JSON.parse(data); } catch {}
+        resolve({ status: res.statusCode, body: parsed, raw: data });
+      });
+    });
+    req.on("error", (e) => resolve({ status: 0, error: e?.message ?? String(e) }));
+    req.setTimeout(30000, () => { req.destroy(); resolve({ status: 0, error: "timed out" }); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+function postJson(url, obj) {
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(url); } catch { resolve({ status: 0, error: "bad url" }); return; }
+    const payload = Buffer.from(JSON.stringify(obj), "utf8");
+    const lib = u.protocol === "http:" ? httpRequest : httpsRequest;
+    const req = lib(u, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": payload.length, Accept: "application/json" },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => { data += c; });
+      res.on("end", () => {
+        let parsed = null;
+        try { parsed = JSON.parse(data); } catch {}
+        resolve({ status: res.statusCode, body: parsed, raw: data });
+      });
+    });
+    req.on("error", (e) => resolve({ status: 0, error: e?.message ?? String(e) }));
+    req.setTimeout(30000, () => { req.destroy(); resolve({ status: 0, error: "timed out" }); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+function openInBrowser(url) {
+  if (process.env.VG_BRAIN_NO_BROWSER) return false; // tests, and headless boxes
+  try {
+    const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    const child = spawn(cmd, [url], { stdio: "ignore", detached: true });
+    // No listener here and a missing opener takes the whole script down with an
+    // unhandled 'error' event — after it has already told you to check your
+    // browser. Swallow it; the URL is printed either way.
+    child.on("error", () => {});
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Waits for the browser to come back to us with ?code=. Resolves once, and
+// always shows the person something in the tab rather than a dead connection.
+function awaitCallback(server, state) {
+  return new Promise((resolve) => {
+    let settled = false;
+    // The give-up timer has to be cleared, not just ignored. A pending timeout
+    // keeps Node's event loop alive, so without this the script sits there for
+    // five minutes AFTER telling you it signed you in successfully.
+    let giveUp = null;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      if (giveUp) clearTimeout(giveUp);
+      resolve(v);
+    };
+    server.on("request", (req, res) => {
+      const u = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (u.pathname !== "/callback") { res.writeHead(404); res.end(); return; }
+      const code = u.searchParams.get("code");
+      const got = u.searchParams.get("state");
+      const err = u.searchParams.get("error");
+      const page = (title, body) =>
+        `<!doctype html><meta charset="utf-8"><title>${title}</title>` +
+        `<body style="font:16px -apple-system,system-ui,sans-serif;max-width:32em;margin:15vh auto;padding:0 1.5em;color:#172D36">` +
+        `<h2 style="font-weight:600">${title}</h2><p>${body}</p></body>`;
+      if (err) {
+        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(page("Sign-in failed", `The server said: <code>${err}</code>. You can close this tab.`));
+        finish({ error: err });
+        return;
+      }
+      if (!code || got !== state) {
+        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(page("Sign-in failed", "Something didn't line up. Close this tab and run the command again."));
+        finish({ error: got !== state ? "state mismatch" : "no code returned" });
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", Connection: "close" });
+      res.end(page("You're signed in \u{1F9E0}", "Close this tab and go back to your Terminal."));
+      finish({ code });
+    });
+    giveUp = setTimeout(() => finish({ error: "nobody finished signing in within 5 minutes" }), 5 * 60 * 1000);
+  });
+}
+
+async function login() {
+  const verifier = randomBytes(32).toString("base64url");
+  const challenge = sha256("sha256").update(verifier).digest("base64url");
+  const state = randomBytes(16).toString("hex");
+
+  const server = createServer();
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+  const redirectUri = `http://127.0.0.1:${port}/callback`;
+
+  try {
+    // Register as a PUBLIC client — no secret to store, nothing to leak.
+    const reg = await postJson(`${BASE}/oauth/register`, {
+      client_name: "VG Brain transcript backfill",
+      redirect_uris: [redirectUri],
+      token_endpoint_auth_method: "none",
+    });
+    if (reg.status !== 200 && reg.status !== 201) {
+      die(
+        `could not start the sign-in with ${BASE} (${reg.status || "no response"}).` +
+        `${reg.body?.error_description ? `\n  The server said: "${reg.body.error_description}"` : ""}` +
+        "\n  Nothing was uploaded.",
+      );
+    }
+    const clientId = reg.body?.client_id;
+    if (!clientId) die("the server didn't give this script an identity to sign in with. Nothing was uploaded.");
+
+    const authUrl = `${BASE}/oauth/authorize?` + new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      state,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    }).toString();
+
+    process.stdout.write(
+      "\nOpening your browser so you can sign in to VG Brain.\n" +
+      "Use the same account you use for everything else.\n\n",
+    );
+    if (!openInBrowser(authUrl)) {
+      process.stdout.write("Couldn't open it for you. Paste this into your browser:\n\n");
+    }
+    process.stdout.write(`  ${authUrl}\n\nWaiting…\n`);
+
+    const back = await awaitCallback(server, state);
+    if (back.error) die(`sign-in didn't finish (${back.error}). Nothing was uploaded.`);
+
+    const tok = await postForm(`${BASE}/oauth/token`, {
+      grant_type: "authorization_code",
+      code: back.code,
+      redirect_uri: redirectUri,
+      client_id: clientId,
+      code_verifier: verifier,
+    });
+    if (tok.status !== 200 || !tok.body?.access_token) {
+      die(
+        `the sign-in was accepted but the token step failed (${tok.status || "no response"}).` +
+        `${tok.body?.error_description ? `\n  The server said: "${tok.body.error_description}"` : ""}` +
+        "\n  Nothing was uploaded.",
+      );
+    }
+
+    const kept = saveLogin(tok.body.access_token, Number(tok.body.expires_in));
+    process.stdout.write(
+      `\nSigned in.${kept ? ` Saved to ${LOGIN_FILE.replace(HOME, "~")} so you won't have to do this again.` : ""}\n\n`,
+    );
+    return { token: tok.body.access_token, from: "the sign-in you just did", minted: false };
+  } finally {
+    // close() alone waits for the browser's keep-alive socket to time out.
+    server.closeAllConnections?.();
+    server.close();
+  }
+}
+
 
 function httpJson(method, url, token, bodyObj) {
   return new Promise((resolve) => {
@@ -519,15 +755,13 @@ function rejectedMessage(auth, probe) {
     `  It came from ${auth.from}.${said}\n` +
     tokenHint(auth.token) + "\n";
   const fix = auth.minted
-    ? "\n  A minted token is either in the server's table or it isn't — it does not\n" +
-      "  expire on a clock. Mint a fresh one and copy the WHOLE line it prints:\n" +
-      "    fly ssh console -a vg-brain\n" +
-      "    node /app/dist/mint-token.js --user=<your handle> --email=<your email> --label=backfill\n" +
-      "  Then, back on this Mac:  export VG_BRAIN_TOKEN=<the 64 characters>\n" +
-      "  Check it before doing anything big:  node " + ME + " --whoami\n"
-    : "\n  A connector login lasts about 30 days and never renews itself, so this is\n" +
-      "  most likely just expired. Reconnect VG Brain in Claude and run this again,\n" +
-      "  or ask Liam for a token and:  export VG_BRAIN_TOKEN=...\n";
+    ? "\n  That token came from VG_BRAIN_TOKEN, which you set by hand. A minted token\n" +
+      "  is either in the server's table or it isn't — it doesn't expire on a clock,\n" +
+      "  so a rejection means it's the wrong string or it was never really minted.\n" +
+      "  You don't need one. Sign in as yourself instead:\n" +
+      `    unset VG_BRAIN_TOKEN && node ${ME} --login\n`
+    : "\n  Logins expire after about a month and don't renew themselves. Sign in again:\n" +
+      `    node ${ME} --login\n`;
   return head + fix + "\n  Nothing was uploaded.";
 }
 
@@ -538,7 +772,7 @@ function rejectedMessage(auth, probe) {
 async function whoami() {
   const auth = resolveToken();
   if (!auth) {
-    die("no login found on this Mac. Either connect VG Brain in Claude, or:  export VG_BRAIN_TOKEN=...");
+    die(`no login found on this Mac. Run:  node ${ME} --login`);
   }
   process.stdout.write(`\nChecking ${BASE}\n  Login from ${auth.from}\n  ${tokenShape(auth.token)}\n\n`);
   const r = await httpJson("GET", `${BASE}/context-header?source=whoami`, auth.token);
@@ -691,14 +925,19 @@ async function sendOne(r, held, token, label) {
 
 
 async function send(kept) {
-  const auth = resolveToken();
+  let auth = resolveToken();
   if (!auth) {
-    die(
-      "you're not signed in to VG Brain on this Mac, so there's nothing to send with.\n" +
-      "  Either connect VG Brain in Claude once (that caches a login under ~/.mcp-auth),\n" +
-      "  or ask Liam for a token and run:  export VG_BRAIN_TOKEN=...  then try again.\n" +
-      "  Nothing was uploaded.",
-    );
+    // Don't send anyone away to fetch a credential — just sign them in.
+    if (process.stdin.isTTY) {
+      process.stdout.write("\nYou're not signed in to VG Brain on this Mac yet. Let's fix that first.\n");
+      auth = await login();
+    } else {
+      die(
+        "you're not signed in to VG Brain on this Mac, so there's nothing to send with.\n" +
+        `  Run:  node ${ME} --login\n` +
+        "  Nothing was uploaded.",
+      );
+    }
   }
 
   // Check the login BEFORE asking anyone to commit to a 1GB upload. The cached
@@ -820,6 +1059,18 @@ async function send(kept) {
 // --- main ------------------------------------------------------------------
 
 async function main() {
+  if (args.logout) {
+    try { unlinkSync(LOGIN_FILE); process.stdout.write("\nSigned out on this Mac.\n\n"); }
+    catch { process.stdout.write("\nThere was no saved sign-in to forget.\n\n"); }
+    return;
+  }
+
+  if (args.login) {
+    await login();
+    await whoami();
+    return;
+  }
+
   if (args.whoami) {
     await whoami();
     return;

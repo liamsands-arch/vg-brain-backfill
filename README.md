@@ -15,6 +15,8 @@ Open Terminal and paste these in, one at a time:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/backfill.mjs -o backfill.mjs
 
+node backfill.mjs --login  # SIGN IN — opens your browser, once
+
 node backfill.mjs          # LOOK — what's on this machine?
 
 node backfill.mjs --send   # SEND — upload it
@@ -76,16 +78,25 @@ notes later the same day rather than straight away.
 Re-running it is safe. It asks the server what it already has and skips it, so
 you won't get duplicates and you won't re-upload gigabytes.
 
-## If it says you're not signed in
+## Signing in
 
-The script reuses the VG Brain login cached on your Mac at `~/.mcp-auth`, which
-only exists if you installed VG Brain as a local plugin. If you don't have one,
-ask Liam for a token, then:
+`node backfill.mjs --login` opens your browser. Sign in with the same account
+you use for VG Brain and you're done — it's saved on this Mac, and it tells you
+whose brain you just connected to so you can be sure it's yours.
+
+Nobody sends you a password or a token. Nothing gets pasted into Slack. It's
+the same sign-in the VG Brain connector does, and if you already have the
+connector installed the script finds that login on its own and you can skip
+this step entirely.
+
+Two others worth knowing:
 
 ```sh
-export VG_BRAIN_TOKEN=paste-it-here
-node backfill.mjs --send
+node backfill.mjs --whoami   # is my sign-in working, and whose brain is it?
+node backfill.mjs --logout   # forget the sign-in on this Mac
 ```
+
+Logins last about a month. When one runs out, `--login` again.
 
 ## If it says "NOT stored — capture-disabled"
 
