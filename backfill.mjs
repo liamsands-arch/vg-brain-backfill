@@ -33,6 +33,7 @@
  *   --path=/some/dir       also search here
  *   --quick                skip reading the files (sizes and dates only)
  *   --json                 machine-readable scan output
+ *   --whoami               check the login and print who the server thinks you are
  *   --yes                  don't ask before uploading
  *   --delay-ms=750         pause between uploads
  *
@@ -444,10 +445,32 @@ function cachedToken() {
   }
 }
 
+// A 401 tells you nothing about WHY, and the two sources fail for completely
+// different reasons: a cached connector login expires on its own after about a
+// month, while a minted token is either in the server's table or it isn't. So
+// describe what we're actually holding — enough to spot a truncated paste, a
+// stray quote, or a literal "..." — without ever printing the secret.
+function tokenShape(tok) {
+  if (/^[0-9a-f]{64}$/i.test(tok)) return "a 64-character minted token, which is the right shape";
+  if (tok.split(".").length === 3) return "a login token (JWT)";
+  return `${tok.length} characters, which is NOT the shape of either a minted token (64 hex) or a login token`;
+}
+
+function tokenHint(tok) {
+  const bits = [`  What you sent: ${tokenShape(tok)}`];
+  if (tok.length >= 8) bits.push(`  It starts ${tok.slice(0, 4)}… and ends …${tok.slice(-4)}`);
+  if (/["']/.test(tok)) bits.push("  It contains a quote character — you may have pasted the quotes too.");
+  if (/\s/.test(tok)) bits.push("  It contains a space or newline in the middle.");
+  if (tok.includes("...") || tok.includes("\u2026")) bits.push("  It contains \"...\" — that was a placeholder, not the token.");
+  return bits.join("\n");
+}
+
 function resolveToken() {
-  const env = String(process.env.VG_BRAIN_TOKEN || "").trim();
-  if (env) return { token: env, from: "the VG_BRAIN_TOKEN environment variable" };
-  return cachedToken();
+  const rawEnv = String(process.env.VG_BRAIN_TOKEN || "");
+  const env = rawEnv.trim();
+  if (env) return { token: env, from: "the VG_BRAIN_TOKEN environment variable", minted: true };
+  const cached = cachedToken();
+  return cached ? { ...cached, minted: false } : null;
 }
 
 // --- http ------------------------------------------------------------------
@@ -487,6 +510,50 @@ function httpJson(method, url, token, bodyObj) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+
+function rejectedMessage(auth, probe) {
+  const said = probe.body?.error ? `\n  The server said: "${probe.body.error}"` : "";
+  const head =
+    `the server rejected that login (${probe.status}).\n` +
+    `  It came from ${auth.from}.${said}\n` +
+    tokenHint(auth.token) + "\n";
+  const fix = auth.minted
+    ? "\n  A minted token is either in the server's table or it isn't — it does not\n" +
+      "  expire on a clock. Mint a fresh one and copy the WHOLE line it prints:\n" +
+      "    fly ssh console -a vg-brain\n" +
+      "    node /app/dist/mint-token.js --user=<your handle> --email=<your email> --label=backfill\n" +
+      "  Then, back on this Mac:  export VG_BRAIN_TOKEN=<the 64 characters>\n" +
+      "  Check it before doing anything big:  node " + ME + " --whoami\n"
+    : "\n  A connector login lasts about 30 days and never renews itself, so this is\n" +
+      "  most likely just expired. Reconnect VG Brain in Claude and run this again,\n" +
+      "  or ask Liam for a token and:  export VG_BRAIN_TOKEN=...\n";
+  return head + fix + "\n  Nothing was uploaded.";
+}
+
+// Answers the question you actually have when a 401 shows up: does this login
+// work, and who does the server think I am? Worth running before committing to
+// a big upload — a token minted against the wrong tenant does NOT 401, it just
+// files everything somewhere you'll never look.
+async function whoami() {
+  const auth = resolveToken();
+  if (!auth) {
+    die("no login found on this Mac. Either connect VG Brain in Claude, or:  export VG_BRAIN_TOKEN=...");
+  }
+  process.stdout.write(`\nChecking ${BASE}\n  Login from ${auth.from}\n  ${tokenShape(auth.token)}\n\n`);
+  const r = await httpJson("GET", `${BASE}/context-header?source=whoami`, auth.token);
+  if (r.status === 401 || r.status === 403) {
+    die(rejectedMessage(auth, r));
+  }
+  if (r.status !== 200) {
+    die(`${BASE} answered ${r.status || "nothing"}${r.error ? ` (${r.error})` : ""}. Nothing was uploaded.`);
+  }
+  const header = String(r.body?.header ?? "");
+  const lines = header.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 12);
+  process.stdout.write("Your login works. Here is how the brain greets you — check that this is\nYOUR brain and not an empty one before you upload anything:\n\n");
+  for (const l of lines) process.stdout.write(`  ${l}\n`);
+  process.stdout.write(`\n  (${header.length} characters of context in total)\n\n`);
+}
 
 // --- the send --------------------------------------------------------------
 
@@ -642,14 +709,7 @@ async function send(kept) {
     "GET", `${BASE}/ingest/cursor?session_id=auth-probe-0000`, auth.token,
   );
   if (probe.status === 401 || probe.status === 403) {
-    die(
-      `the server rejected that login (${probe.status}).\n` +
-      `  It came from ${auth.from}.\n` +
-      "  A connector login lasts about 30 days and does not renew itself, so this is\n" +
-      "  probably just expired. Reconnect VG Brain in Claude and run this again, or\n" +
-      "  ask Liam for a token and:  export VG_BRAIN_TOKEN=...\n" +
-      "  Nothing was uploaded.",
-    );
+    die(rejectedMessage(auth, probe));
   }
   if (probe.status === 0) {
     die(`could not reach ${BASE} (${probe.error ?? "no response"}). Nothing was uploaded.`);
@@ -760,6 +820,11 @@ async function send(kept) {
 // --- main ------------------------------------------------------------------
 
 async function main() {
+  if (args.whoami) {
+    await whoami();
+    return;
+  }
+
   const rows = await scan();
   if (rows.length === 0) return;
 
