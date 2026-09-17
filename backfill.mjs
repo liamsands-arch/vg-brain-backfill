@@ -226,6 +226,14 @@ function sessionIdFor(path) {
 // every slash with a dash: /Users/sam/code/acme -> -Users-sam-code-acme. The
 // last segment is the part a human recognizes.
 function projectLabelFor(path) {
+  // Cowork first. Each local agent session runs in its own local_<uuid>
+  // container that carries a WHOLE .claude/projects/ tree inside it, so the
+  // Claude Code branch below would otherwise win and label every one of them
+  // after whatever the container's cwd happened to be — 100+ rows all reading
+  // "outputs". They are one thing to a human: Cowork chats.
+  if (/local-agent-mode-sessions/.test(path)) return "Cowork  (local sessions)";
+  if (/[\\/]local_[0-9a-f-]{36}([\\/]|$)/i.test(path)) return "Cowork  (local sessions)";
+
   const parts = path.split(sep);
   const i = parts.lastIndexOf("projects");
   if (i >= 0 && parts.length > i + 1) {
@@ -233,11 +241,6 @@ function projectLabelFor(path) {
     const tail = slug.split("-").filter(Boolean).pop();
     return tail ? `${tail}  (${slug})` : slug;
   }
-  // Cowork kept each local agent session in its own local_<uuid> folder. The
-  // uuid means nothing to a human, so group them all under one heading rather
-  // than printing a hundred rows of hex.
-  if (/local-agent-mode-sessions/.test(path)) return "Cowork  (local sessions)";
-  if (/[\\/]local_[0-9a-f-]{36}[\\/]/i.test(path)) return "Cowork  (local sessions)";
   return dirname(path).replace(HOME, "~");
 }
 
@@ -487,6 +490,139 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --- the send --------------------------------------------------------------
 
+// A transcript goes up in pieces. /ingest caps a request body and the biggest
+// chats here run past 80MB, so anything over CHUNK_BYTES is uploaded as a
+// sequence: the first piece creates the row, each later one is a
+// compare-and-swap append at the byte offset the server says it has. The
+// server concatenates them, so the row ends up byte-identical to the file.
+// Overridable so the tests can exercise the multi-piece path without
+// generating a 17MB fixture.
+const CHUNK_BYTES = Math.max(1024, Number(process.env.VG_BRAIN_CHUNK_BYTES) || 16 * 1024 * 1024);
+
+// Where to end a chunk that is NOT the end of the file.
+//
+// Two things must hold. The pieces have to concatenate back into the original
+// file byte for byte — that is what makes the server's row equal the transcript
+// — and each piece has to survive Buffer.toString("utf8") on its own, because
+// that is how it goes into JSON. Cutting in the middle of a multi-byte
+// character turns both halves into U+FFFD and nothing downstream would ever
+// flag it. So: prefer a newline (JSONL hands us one every couple hundred
+// bytes), and when a single line is longer than a whole chunk, fall back to the
+// last complete character.
+function utf8Boundary(buf) {
+  let i = buf.length - 1;
+  let steps = 0;
+  while (i >= 0 && (buf[i] & 0xc0) === 0x80 && steps < 3) { i--; steps++; }
+  if (i < 0) return buf.length;
+  const lead = buf[i];
+  const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+  // The final sequence is complete — keep everything. Otherwise stop before it
+  // and let the next chunk carry the whole character.
+  return buf.length - i >= need ? buf.length : i;
+}
+
+function cutAt(buf) {
+  const nl = buf.lastIndexOf(0x0a);
+  // Ignore a newline so early in the window that honouring it would shrink the
+  // chunk to nothing and turn one upload into hundreds.
+  if (nl >= 0 && nl + 1 >= buf.length / 2) return nl + 1;
+  return utf8Boundary(buf);
+}
+
+function readRange(path, from, len) {
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(len);
+    const got = readSync(fd, buf, 0, len, from);
+    return buf.slice(0, got);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+async function sendOne(r, held, token, label) {
+  const meta = { transcript_path: r.path, hook_event_name: "Backfill", backfill: true };
+  // "claude-code-*" tells the server this came from a dev-side install, which
+  // is what walls the resulting notes to your own private zone.
+  const common = { reason: "backfill", source: "claude-code-backfill-script", meta };
+
+  let at = held;
+  let wrote = 0;
+  let retriedFull = false;
+  const pieces = Math.ceil((r.size - held) / CHUNK_BYTES);
+  let piece = 0;
+
+  while (at < r.size) {
+    piece++;
+    let buf;
+    try {
+      const remaining = r.size - at;
+      const take = Math.min(CHUNK_BYTES, remaining);
+      const window = readRange(r.path, at, take);
+      // Only trim when there is more file after this window; the last piece
+      // ends where the file ends.
+      buf = take < remaining ? window.slice(0, cutAt(window)) : window;
+    } catch (e) {
+      process.stdout.write(`${label} could not read the file\n`);
+      return { ok: false, why: `could not read it (${e?.message ?? e})` };
+    }
+    if (buf.length === 0) break;
+
+    const body = at === 0
+      ? { ...common, session_id: r.sessionId, transcript: buf.toString("utf8") }
+      : { ...common, session_id: r.sessionId, append: true, from_bytes: at, transcript: buf.toString("utf8") };
+
+    let resp = await httpJson("POST", `${BASE}/ingest`, token, body);
+
+    if (resp.status === 429) {
+      process.stdout.write(`${label} server asked us to slow down — waiting 30s\n`);
+      await sleep(30000);
+      resp = await httpJson("POST", `${BASE}/ingest`, token, body);
+    }
+
+    // The cursor moved under us (row purged, or another device sent some).
+    // Start the whole file over as a fresh upload, once.
+    if (resp.status === 409 && resp.body?.resend === "full" && !retriedFull) {
+      retriedFull = true;
+      at = 0;
+      wrote = 0;
+      piece = 0;
+      continue;
+    }
+
+    if (resp.status === 401) {
+      die("the server rejected your login (401) partway through. Reconnect VG Brain in Claude, or get a fresh token, then run this again — nothing you already sent will be sent twice.");
+    }
+
+    const okStatus = resp.status === 200 || resp.status === 201 || resp.status === 202;
+    if (!okStatus) {
+      const why = resp.error ?? resp.body?.error ?? `HTTP ${resp.status}`;
+      process.stdout.write(`${label} FAILED — ${why}\n`);
+      return { ok: false, why };
+    }
+    // A 202 with staged:false means the server took the request but is not
+    // accepting chats right now. That is not a success and must not read
+    // like one.
+    if (resp.body && resp.body.staged === false) {
+      const why = resp.body.reason ?? "the server declined it";
+      process.stdout.write(`${label} NOT stored — ${why}\n`);
+      return { ok: false, refused: true, why };
+    }
+
+    at += buf.length;
+    wrote += buf.length;
+    if (pieces > 1) {
+      process.stdout.write(`${label} ${padLeft(human(wrote), 8)} of ${human(r.size - held)}\r`);
+      await sleep(250);
+    }
+  }
+
+  const tail = pieces > 1 ? `  (in ${piece} pieces)` : held > 0 ? "  (the rest of it)" : "";
+  process.stdout.write(`${label} sent  ${pad(human(wrote), 9)}${tail}\n`);
+  return { ok: true, bytes: wrote };
+}
+
+
 async function send(kept) {
   const auth = resolveToken();
   if (!auth) {
@@ -498,6 +634,27 @@ async function send(kept) {
     );
   }
 
+  // Check the login BEFORE asking anyone to commit to a 1GB upload. The cached
+  // connector token is ~30 days with no refresh, so an expired one is the
+  // normal case, not an edge case — finding that out after "yes" is a waste of
+  // their time.
+  const probe = await httpJson(
+    "GET", `${BASE}/ingest/cursor?session_id=auth-probe-0000`, auth.token,
+  );
+  if (probe.status === 401 || probe.status === 403) {
+    die(
+      `the server rejected that login (${probe.status}).\n` +
+      `  It came from ${auth.from}.\n` +
+      "  A connector login lasts about 30 days and does not renew itself, so this is\n" +
+      "  probably just expired. Reconnect VG Brain in Claude and run this again, or\n" +
+      "  ask Liam for a token and:  export VG_BRAIN_TOKEN=...\n" +
+      "  Nothing was uploaded.",
+    );
+  }
+  if (probe.status === 0) {
+    die(`could not reach ${BASE} (${probe.error ?? "no response"}). Nothing was uploaded.`);
+  }
+
   const totalSize = kept.reduce((n, r) => n + r.size, 0);
   process.stdout.write(
     `About to send ${plural(kept.length, "chat")} (${human(totalSize)}) to ${BASE}.\n` +
@@ -505,6 +662,20 @@ async function send(kept) {
     "These become notes in YOUR OWN brain. Nobody else can read them unless you\n" +
     "share a note later. Chats the brain already has are skipped.\n\n",
   );
+
+  // A big pile is worth a second thought: every chat gets read by a model on
+  // the server, so a thousand-chat run is real time and real money, and it
+  // lands as a lot of notes at once. Say so rather than letting somebody find
+  // out afterwards.
+  if (kept.length > 50 || totalSize > 200 * 1024 * 1024) {
+    process.stdout.write(
+      "That's a lot at once. The brain reads every one of these to work out what's\n" +
+      "worth keeping, so a pile this size takes a while and lands as a lot of notes.\n" +
+      "You can do it in batches instead — this is safe to run over and over, and it\n" +
+      "skips whatever already went:\n" +
+      `  node ${ME} --since=2026-07-01 --send\n\n`,
+    );
+  }
 
   if (!args.yes) {
     // No keyboard attached (piped, cron, a CI runner) — there is nobody to say
@@ -536,7 +707,7 @@ async function send(kept) {
     if (cur.status === 401) {
       die("the server rejected your login (401). Reconnect VG Brain in Claude, or get a fresh token, then run this again.");
     }
-    const held = cur.status === 200 && typeof cur.body?.bytes === "number" ? cur.body.bytes : 0;
+    let held = cur.status === 200 && typeof cur.body?.bytes === "number" ? cur.body.bytes : 0;
 
     if (held >= r.size && held > 0) {
       skipped++;
@@ -544,74 +715,16 @@ async function send(kept) {
       continue;
     }
 
-    let body;
-    try {
-      if (held > 0 && held < r.size) {
-        const fd = openSync(r.path, "r");
-        try {
-          const buf = Buffer.alloc(r.size - held);
-          const got = readSync(fd, buf, 0, r.size - held, held);
-          body = {
-            session_id: r.sessionId,
-            append: true,
-            from_bytes: held,
-            transcript: buf.slice(0, got).toString("utf8"),
-          };
-        } finally { closeSync(fd); }
-      } else {
-        body = { session_id: r.sessionId, transcript: readFileSync(r.path, "utf8") };
-      }
-    } catch (e) {
-      failed++;
-      problems.push(`${r.path}: could not read it (${e?.message ?? e})`);
-      process.stdout.write(`${label} could not read the file\n`);
-      continue;
-    }
-
-    body.reason = "backfill";
-    // "claude-code-*" tells the server this came from a dev-side install, which
-    // is what walls the resulting notes to your own private zone.
-    body.source = "claude-code-backfill-script";
-    body.meta = { transcript_path: r.path, hook_event_name: "Backfill", backfill: true };
-
-    let resp = await httpJson("POST", `${BASE}/ingest`, auth.token, body);
-
-    // The cursor moved under us (the row was purged, or another device sent
-    // some). Start over with the whole file, once.
-    if (resp.status === 409 && resp.body?.resend === "full") {
-      try {
-        resp = await httpJson("POST", `${BASE}/ingest`, auth.token, {
-          ...body, append: undefined, from_bytes: undefined, transcript: readFileSync(r.path, "utf8"),
-        });
-      } catch {}
-    }
-
-    if (resp.status === 429) {
-      process.stdout.write(`${label} server asked us to slow down — waiting 30s\n`);
-      await sleep(30000);
-      resp = await httpJson("POST", `${BASE}/ingest`, auth.token, body);
-    }
-
-    if (resp.status === 200 || resp.status === 201 || resp.status === 202) {
-      // A 202 with staged:false means the server took the request but is not
-      // accepting chats right now. That is not a success and must not read
-      // like one.
-      if (resp.body && resp.body.staged === false) {
-        refused++;
-        const why = resp.body.reason ?? "the server declined it";
-        process.stdout.write(`${label} NOT stored — ${why}\n`);
-        problems.push(`${basename(r.path)}: not stored (${why})`);
-      } else {
-        sent++;
-        const wire = r.size - Math.min(held, r.size);
-        bytesSent += wire;
-        process.stdout.write(`${label} sent  ${human(wire)}${held > 0 ? " (the rest of it)" : ""}\n`);
-      }
+    const outcome = await sendOne(r, held, auth.token, label);
+    if (outcome.ok) {
+      sent++;
+      bytesSent += outcome.bytes;
+    } else if (outcome.refused) {
+      refused++;
+      problems.push(`${basename(r.path)}: not stored (${outcome.why})`);
     } else {
       failed++;
-      const why = resp.error ?? resp.body?.error ?? `HTTP ${resp.status}`;
-      process.stdout.write(`${label} FAILED — ${why}\n`);
-      problems.push(`${basename(r.path)}: ${why}`);
+      problems.push(`${basename(r.path)}: ${outcome.why}`);
     }
 
     if (n < kept.length) await sleep(DELAY_MS);
