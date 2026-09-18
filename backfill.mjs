@@ -902,11 +902,24 @@ function readRange(path, from, len) {
   }
 }
 
+// Which kind of session this file came from, because the server routes on it.
+//
+// A "claude-code-*" source is WALLED to people/<you>/dev — a sealed leaf for
+// infra and secrets, excluded from the shareable zone entirely. That is right
+// for an actual Claude Code session and wrong for everything else: a Cowork
+// chat about a client's forecast is ordinary work and belongs in the ordinary
+// private zone, people/<you>, where you can find it and share it if you choose.
+// Both are private to you; the dev wall is an extra seal, not the privacy.
+function sourceFor(path) {
+  if (/local-agent-mode-sessions/.test(path)) return "cowork-backfill-script";
+  if (/[\\/]local_[0-9a-f-]{36}([\\/]|$)/i.test(path)) return "cowork-backfill-script";
+  if (/[\\/]\.claude[\\/]projects[\\/]/.test(path)) return "claude-code-backfill-script";
+  return "cowork-backfill-script";
+}
+
 async function sendOne(r, held, token, label) {
   const meta = { transcript_path: r.path, hook_event_name: "Backfill", backfill: true };
-  // "claude-code-*" tells the server this came from a dev-side install, which
-  // is what walls the resulting notes to your own private zone.
-  const common = { reason: "backfill", source: "claude-code-backfill-script", meta };
+  const common = { reason: "backfill", source: sourceFor(r.path), meta };
 
   let at = held;
   let wrote = 0;
