@@ -91,6 +91,11 @@ notes later the same day rather than straight away.
 Re-running it is safe. It asks the server what it already has and skips it, so
 you won't get duplicates and you won't re-upload gigabytes.
 
+One thing that can look like a failure but isn't: if a chat was already saved
+to the brain back when it happened, sending it again files nothing. The brain
+recognises it and declines to write the same conversation twice. Chats it has
+never seen — which is the whole point of this — get read properly.
+
 ## Signing in
 
 `node backfill.mjs --login` opens your browser. Sign in with the same account
