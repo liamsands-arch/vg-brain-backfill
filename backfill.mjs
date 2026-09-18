@@ -475,13 +475,34 @@ function tokenHint(tok) {
   return bits.join("\n");
 }
 
+// Things people export when they copy an instruction verbatim. None of them is
+// a credential, and treating one as "the user explicitly chose this" is how a
+// stale env var silently shadows a sign-in that just succeeded.
+const PLACEHOLDERS = /^(\.{2,}|\u2026|<.*>|\[.*\]|paste[-_ ]?it[-_ ]?here|your[-_ ]?token|token|xxx+|tbd|none|null|undefined)$/i;
+
 function resolveToken() {
-  const rawEnv = String(process.env.VG_BRAIN_TOKEN || "");
-  const env = rawEnv.trim();
-  if (env) return { token: env, from: "the VG_BRAIN_TOKEN environment variable", minted: true };
+  const env = String(process.env.VG_BRAIN_TOKEN || "").trim();
   const saved = savedLogin();
-  if (saved) return saved;
   const cached = cachedToken();
+
+  if (env && !PLACEHOLDERS.test(env)) {
+    // An explicitly set token wins, but say so when it is standing in front of
+    // a sign-in — otherwise a rejection looks like the sign-in failed.
+    if (saved) {
+      process.stdout.write(
+        "Note: VG_BRAIN_TOKEN is set, so it's being used instead of the sign-in saved\n" +
+        `on this Mac. Run  unset VG_BRAIN_TOKEN  to use the sign-in instead.\n\n`,
+      );
+    }
+    return { token: env, from: "the VG_BRAIN_TOKEN environment variable", minted: true };
+  }
+  if (env) {
+    process.stdout.write(
+      `Ignoring VG_BRAIN_TOKEN — it's set to ${JSON.stringify(env)}, which is a\n` +
+      "placeholder, not a token. Clear it with  unset VG_BRAIN_TOKEN  to stop this notice.\n\n",
+    );
+  }
+  if (saved) return saved;
   return cached ? { ...cached, minted: false } : null;
 }
 
@@ -659,7 +680,7 @@ async function login() {
     if (reg.status !== 200 && reg.status !== 201) {
       die(
         `could not start the sign-in with ${BASE} (${reg.status || "no response"}).` +
-        `${reg.body?.error_description ? `\n  The server said: "${reg.body.error_description}"` : ""}` +
+        `${errText(reg.body) ? `\n  The server said: "${errText(reg.body)}"` : ""}` +
         "\n  Nothing was uploaded.",
       );
     }
@@ -701,7 +722,7 @@ async function login() {
     if (tok.status !== 200 || !tok.body?.access_token) {
       die(
         `the sign-in was accepted but the token step failed (${tok.status || "no response"}).` +
-        `${tok.body?.error_description ? `\n  The server said: "${tok.body.error_description}"` : ""}` +
+        `${errText(tok.body) ? `\n  The server said: "${errText(tok.body)}"` : ""}` +
         "\n  Nothing was uploaded.",
       );
     }
@@ -756,8 +777,26 @@ function httpJson(method, url, token, bodyObj) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 
+// Servers answer with error strings, {message}, {error:{message}}, or an
+// object with no obvious field. Printing "[object Object]" at somebody who is
+// already stuck is worse than printing nothing.
+function errText(body) {
+  const pick = (v) => {
+    if (typeof v === "string") return v.trim();
+    if (v && typeof v === "object") {
+      for (const k of ["error_description", "message", "error", "detail", "reason"]) {
+        const got = pick(v[k]);
+        if (got) return got;
+      }
+      try { const j = JSON.stringify(v); if (j && j !== "{}") return j.slice(0, 200); } catch {}
+    }
+    return "";
+  };
+  return pick(body);
+}
+
 function rejectedMessage(auth, probe) {
-  const said = probe.body?.error ? `\n  The server said: "${probe.body.error}"` : "";
+  const said = errText(probe.body) ? `\n  The server said: "${errText(probe.body)}"` : "";
   const head =
     `the server rejected that login (${probe.status}).\n` +
     `  It came from ${auth.from}.${said}\n` +
@@ -767,7 +806,7 @@ function rejectedMessage(auth, probe) {
       "  is either in the server's table or it isn't — it doesn't expire on a clock,\n" +
       "  so a rejection means it's the wrong string or it was never really minted.\n" +
       "  You don't need one. Sign in as yourself instead:\n" +
-      `    unset VG_BRAIN_TOKEN && node ${ME} --login\n`
+      `    unset VG_BRAIN_TOKEN\n    node ${ME} --login\n`
     : "\n  Logins expire after about a month and don't renew themselves. Sign in again:\n" +
       `    node ${ME} --login\n`;
   return head + fix + "\n  Nothing was uploaded.";
@@ -777,8 +816,11 @@ function rejectedMessage(auth, probe) {
 // work, and who does the server think I am? Worth running before committing to
 // a big upload — a token minted against the wrong tenant does NOT 401, it just
 // files everything somewhere you'll never look.
-async function whoami() {
-  const auth = resolveToken();
+async function whoami(pre) {
+  // Take the sign-in we were just handed rather than going back to the
+  // resolver — otherwise a leftover env var shadows the login of five seconds
+  // ago and reports it as a failure.
+  const auth = pre ?? resolveToken();
   if (!auth) {
     die(`no login found on this Mac. Run:  node ${ME} --login`);
   }
@@ -1074,8 +1116,8 @@ async function main() {
   }
 
   if (args.login) {
-    await login();
-    await whoami();
+    const fresh = await login();
+    await whoami(fresh);
     return;
   }
 
