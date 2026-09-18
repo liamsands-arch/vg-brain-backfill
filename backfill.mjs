@@ -100,6 +100,10 @@ if (args.help || args.h) {
 // Whatever they saved it as — the hints below should echo what they typed, not
 // what we happened to name the file.
 const ME = basename(process.argv[1] || "backfill.mjs");
+// Set when main() signs in up front, so send() uses that instead of resolving
+// again (a resolve would re-read the file we just wrote — harmless, but this is
+// the same shape as the bug where a stale env var shadowed a fresh login).
+let preAuth = null;
 const HOME = homedir();
 // vg-brain.com, not the fly.dev name. Both front the same app, but the Google
 // sign-in callback is registered against the .com host — go through fly.dev and
@@ -999,7 +1003,7 @@ async function sendOne(r, held, token, label) {
 
 
 async function send(kept) {
-  let auth = resolveToken();
+  let auth = preAuth ?? resolveToken();
   if (!auth) {
     // Don't send anyone away to fetch a credential — just sign them in.
     if (process.stdin.isTTY) {
@@ -1146,6 +1150,15 @@ async function send(kept) {
 // --- main ------------------------------------------------------------------
 
 async function main() {
+  // A one-shot `--send` is the whole job in one command: sign in, look, confirm,
+  // upload. Do the sign-in FIRST so the browser opens straight away — scanning a
+  // few hundred transcripts takes a minute, and a minute of silence before the
+  // login prompt reads like a hang.
+  if (args.send && !args.whoami && !args.login && !args.logout && !resolveToken() && process.stdin.isTTY) {
+    process.stdout.write("\nFirst, sign in to VG Brain.\n");
+    preAuth = await login();
+  }
+
   if (args.logout) {
     try { unlinkSync(LOGIN_FILE); process.stdout.write("\nSigned out on this Mac.\n\n"); }
     catch { process.stdout.write("\nThere was no saved sign-in to forget.\n\n"); }

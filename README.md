@@ -12,15 +12,15 @@ brain has never seen them.
 
 Open Terminal and paste these in, one at a time:
 
+Paste this into Terminal. It signs you in, shows you what it found, and asks
+before it sends anything — the only thing you type is `yes`.
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/backfill.mjs -o backfill.mjs
-
-node backfill.mjs --login  # SIGN IN — opens your browser, once
-
-node backfill.mjs          # LOOK — what's on this machine?
-
-node backfill.mjs --send   # SEND — upload it
+curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/backfill.mjs -o backfill.mjs && node backfill.mjs --send
 ```
+
+If you'd rather look before committing to anything, run it without `--send`
+first — that only reads, and uploads nothing.
 
 You need Node 18 or newer. If you've run Claude Code, you have it. Check with
 `node --version`.
