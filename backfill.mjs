@@ -100,7 +100,11 @@ if (args.help || args.h) {
 // what we happened to name the file.
 const ME = basename(process.argv[1] || "backfill.mjs");
 const HOME = homedir();
-const BASE = String(process.env.VG_BRAIN_URL || "https://vg-brain.fly.dev").replace(/\/+$/, "");
+// vg-brain.com, not the fly.dev name. Both front the same app, but the Google
+// sign-in callback is registered against the .com host — go through fly.dev and
+// Google refuses the handoff with redirect_uri_mismatch before you ever reach a
+// password box. VG_BRAIN_URL overrides for anyone who needs it.
+const BASE = String(process.env.VG_BRAIN_URL || "https://vg-brain.com").replace(/\/+$/, "");
 const MIN_MESSAGES = args["min-messages"] === undefined ? 4 : Number(args["min-messages"]);
 const DELAY_MS = args["delay-ms"] === undefined ? 750 : Number(args["delay-ms"]);
 const SINCE = args.since ? Date.parse(args.since + "T00:00:00Z") : null;
@@ -678,7 +682,11 @@ async function login() {
     if (!openInBrowser(authUrl)) {
       process.stdout.write("Couldn't open it for you. Paste this into your browser:\n\n");
     }
-    process.stdout.write(`  ${authUrl}\n\nWaiting…\n`);
+    process.stdout.write(
+      `  ${authUrl}\n\nWaiting…\n` +
+      "(If the browser shows a Google error instead of a sign-in box, stop here and\n" +
+      " send Liam what it says — that's a server setting, not anything you did.)\n",
+    );
 
     const back = await awaitCallback(server, state);
     if (back.error) die(`sign-in didn't finish (${back.error}). Nothing was uploaded.`);
