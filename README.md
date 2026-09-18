@@ -47,6 +47,18 @@ Nothing has been sent. This was a look, not an upload.
 It reads your files and prints counts. It doesn't print what's in them, and it
 doesn't open a network connection at all.
 
+## Trying one first
+
+You don't have to commit to everything at once:
+
+```sh
+node backfill.mjs --limit=1 --send
+```
+
+That sends your single most recent chat and nothing else. Look at your notes
+later in the day, decide you like what came back, then widen. Re-running is
+always safe — it asks the server what it already has and skips it.
+
 ## Narrowing it down before you send
 
 ```sh
@@ -54,6 +66,7 @@ node backfill.mjs --list                  # every file, not just the totals
 node backfill.mjs --since=2025-06-01      # only chats from June onward
 node backfill.mjs --project=acme          # only folders matching "acme"
 node backfill.mjs --exclude=scratch       # skip folders matching "scratch"
+node backfill.mjs --limit=10              # just the 10 most recent
 node backfill.mjs --help                  # everything else
 ```
 

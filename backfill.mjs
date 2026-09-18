@@ -30,6 +30,7 @@
  *   --exclude=sandbox      skip folders whose name contains this text
  *                          (repeat --project / --exclude as many times as you like)
  *   --min-messages=6       skip thin sessions (default 4; --min-messages=0 for all)
+ *   --limit=1              only the N most recent chats — good for trying one first
  *   --path=/some/dir       also search here
  *   --quick                skip reading the files (sizes and dates only)
  *   --json                 machine-readable scan output
@@ -107,11 +108,13 @@ const HOME = homedir();
 const BASE = String(process.env.VG_BRAIN_URL || "https://vg-brain.com").replace(/\/+$/, "");
 const MIN_MESSAGES = args["min-messages"] === undefined ? 4 : Number(args["min-messages"]);
 const DELAY_MS = args["delay-ms"] === undefined ? 750 : Number(args["delay-ms"]);
+const LIMIT = args.limit === undefined ? null : Number(args.limit);
 const SINCE = args.since ? Date.parse(args.since + "T00:00:00Z") : null;
 const UNTIL = args.until ? Date.parse(args.until + "T23:59:59Z") : null;
 
 if (Number.isNaN(MIN_MESSAGES)) die("--min-messages needs a number");
 if (Number.isNaN(DELAY_MS)) die("--delay-ms needs a number");
+if (LIMIT !== null && (!Number.isFinite(LIMIT) || LIMIT < 1)) die("--limit needs a whole number, 1 or more");
 if (args.since && Number.isNaN(SINCE)) die("--since needs a date like 2025-01-01");
 if (args.until && Number.isNaN(UNTIL)) die("--until needs a date like 2026-06-30");
 
@@ -364,7 +367,14 @@ function applyFilters(rows) {
     if (args.exclude.length && args.exclude.some((p) => hay.includes(p.toLowerCase()))) { dropped.named++; continue; }
     kept.push(r);
   }
-  return { kept, dropped };
+  // Newest first, so --limit=1 gives you the chat you most likely care about
+  // and --limit=10 is a sensible first batch rather than an arbitrary ten.
+  kept.sort((a, b) => (b.last ?? b.mtimeMs) - (a.last ?? a.mtimeMs));
+  if (LIMIT !== null && kept.length > LIMIT) {
+    const trimmed = kept.length - LIMIT;
+    return { kept: kept.slice(0, LIMIT), dropped: { ...dropped, limited: trimmed } };
+  }
+  return { kept, dropped: { ...dropped, limited: 0 } };
 }
 
 function report(kept, dropped) {
@@ -411,13 +421,14 @@ function report(kept, dropped) {
     process.stdout.write("\n");
   }
 
-  const skipped = dropped.thin + dropped.dated + dropped.named + dropped.empty;
+  const skipped = dropped.thin + dropped.dated + dropped.named + dropped.empty + (dropped.limited ?? 0);
   if (skipped > 0) {
     const bits = [];
     if (dropped.thin) bits.push(`${dropped.thin} too short (under ${MIN_MESSAGES} messages)`);
     if (dropped.dated) bits.push(`${dropped.dated} outside your date range`);
     if (dropped.named) bits.push(`${dropped.named} filtered out by name`);
     if (dropped.empty) bits.push(`${dropped.empty} empty`);
+    if (dropped.limited) bits.push(`${dropped.limited} beyond your --limit of ${LIMIT}`);
     process.stdout.write(`Left out: ${bits.join(", ")}.\n\n`);
   }
 }
@@ -1042,7 +1053,7 @@ async function send(kept) {
     process.stdout.write("\n");
   }
 
-  let sent = 0, skipped = 0, failed = 0, bytesSent = 0, refused = 0;
+  let sent = 0, skipped = 0, failed = 0, bytesSent = 0, refused = 0, refusedRun = 0;
   const problems = [];
   let n = 0;
 
@@ -1068,11 +1079,24 @@ async function send(kept) {
     if (outcome.ok) {
       sent++;
       bytesSent += outcome.bytes;
+      refusedRun = 0;
     } else if (outcome.refused) {
       refused++;
+      refusedRun++;
       problems.push(`${basename(r.path)}: not stored (${outcome.why})`);
+      // The server isn't taking chats. It will not start taking them on the
+      // 200th try, and grinding through the rest just buries the reason under
+      // a wall of identical lines.
+      if (refusedRun >= 3 && n < kept.length) {
+        process.stdout.write(
+          `\nStopping — the server has turned away ${refusedRun} in a row, so it isn't\n` +
+          `accepting chats right now. ${kept.length - n} left untried.\n`,
+        );
+        break;
+      }
     } else {
       failed++;
+      refusedRun = 0;
       problems.push(`${basename(r.path)}: ${outcome.why}`);
     }
 
@@ -1150,6 +1174,7 @@ async function main() {
       `  node ${ME} --send\n\n` +
       "To narrow it down first:\n" +
       `  node ${ME} --list\n` +
+      `  node ${ME} --limit=1 --send        # try one first\n` +
       `  node ${ME} --since=2025-06-01\n` +
       `  node ${ME} --project=acme --send\n` +
       `  node ${ME} --exclude=scratch --send\n\n`,
