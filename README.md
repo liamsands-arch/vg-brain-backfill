@@ -10,22 +10,40 @@ brain has never seen them.
 
 ## Use it
 
-Open Terminal and paste these in, one at a time:
-
-Paste this into Terminal. It signs you in, shows you what it found, and asks
-before it sends anything — the only thing you type is `yes`.
+Open Terminal and paste this in. It signs you in, shows you what it found, and
+asks before it sends anything — the only thing you type is `yes`.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/backfill.mjs -o backfill.mjs && node backfill.mjs --send
+bash <(curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/run.sh) --send
 ```
 
-If you'd rather look before committing to anything, run it without `--send`
-first — that only reads, and uploads nothing.
+That works whether or not you have Node on your Mac (most Cowork users don't).
+If you don't, it borrows a private copy just for this run. Everything it
+downloads goes in a temporary folder that's deleted when it finishes, even if
+you stop it halfway, so there's nothing to clean up afterwards.
 
-You need Node 18 or newer. If you've run Claude Code, you have it. Check with
-`node --version`.
+If you'd rather look before committing to anything, leave off `--send` — that
+only reads, and uploads nothing:
 
-## What the first command does
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/run.sh)
+```
+
+Paste it exactly as written. The `bash <(…)` part matters: it keeps the `yes`
+question working.
+
+### If you already have Node
+
+If `node --version` prints v18 or higher, you can also save the script and run
+it directly. The rest of this page uses this shorter form; with the one-liner
+above, just put the same options after it instead of after `node backfill.mjs`.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/backfill.mjs -o backfill.mjs
+node backfill.mjs --send
+```
+
+## What looking does
 
 Nothing goes anywhere. It walks the places Claude used to keep transcripts —
 `~/.claude/projects`, `~/Library/Application Support/Claude` and a couple of
@@ -45,14 +63,21 @@ Nothing has been sent. This was a look, not an upload.
 ```
 
 It reads your files and prints counts. It doesn't print what's in them, and it
-doesn't open a network connection at all.
+doesn't send anything anywhere. (The one-liner does download the script itself,
+and Node if you need it, before it starts looking.)
+
+Cowork kept two copies of most chats: the chat itself and an `audit.jsonl` log
+of the same session. The script counts each chat once and leaves the extra log
+out (the summary says "duplicate Cowork logs"), so you don't end up with two
+notes about the same conversation. If the log is the only copy of a chat, it's
+kept.
 
 ## Trying one first
 
 You don't have to commit to everything at once:
 
 ```sh
-node backfill.mjs --limit=1 --send
+bash <(curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/run.sh) --limit=1 --send
 ```
 
 That sends your single most recent chat and nothing else. Look at your notes
@@ -60,6 +85,10 @@ later in the day, decide you like what came back, then widen. Re-running is
 always safe — it asks the server what it already has and skips it.
 
 ## Narrowing it down before you send
+
+These are written in the short `node backfill.mjs` form. If you're using the
+one-liner, put the same option after it instead, like
+`bash <(curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/run.sh) --list`.
 
 ```sh
 node backfill.mjs --list                  # every file, not just the totals
@@ -76,7 +105,7 @@ Combine them with `--send` when you're happy:
 node backfill.mjs --since=2025-06-01 --exclude=scratch --send
 ```
 
-## What the second command does
+## What sending does
 
 Asks you to type `yes`, then uploads.
 
@@ -106,6 +135,9 @@ Nobody sends you a password or a token. Nothing gets pasted into Slack. It's
 the same sign-in the VG Brain connector does, and if you already have the
 connector installed the script finds that login on its own and you can skip
 this step entirely.
+
+(`--send` signs you in on its own the first time, so you rarely need this.
+All of these work after the one-liner too.)
 
 Two others worth knowing:
 

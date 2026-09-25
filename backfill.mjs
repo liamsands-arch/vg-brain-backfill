@@ -8,7 +8,11 @@
  * the cloud now, so nothing new lands on disk — but the old files are still
  * there, and the brain never saw them. This finds them and hands them over.
  *
- * Get it:
+ * Easiest way to run it — works with or without Node, leaves nothing behind:
+ *
+ *   bash <(curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/run.sh) --send
+ *
+ * Or, if you already have Node 18+, get the script itself:
  *
  *   curl -fsSL https://raw.githubusercontent.com/liamsands-arch/vg-brain-backfill/main/backfill.mjs -o backfill.mjs
  *
@@ -100,6 +104,12 @@ if (args.help || args.h) {
 // Whatever they saved it as — the hints below should echo what they typed, not
 // what we happened to name the file.
 const ME = basename(process.argv[1] || "backfill.mjs");
+// Every "run this next" hint goes through here, so it matches how this run was
+// started. run.sh sets VG_BACKFILL_LAUNCHER to its own one-liner — the person
+// may have no `node` on their PATH at all, so `node backfill.mjs` would be a
+// command that doesn't work for them. Otherwise it's plain `node <file>`.
+const LAUNCHER = String(process.env.VG_BACKFILL_LAUNCHER || "").trim() || `node ${ME}`;
+const rerun = (flags) => (flags ? `${LAUNCHER} ${flags}` : LAUNCHER);
 // Set when main() signs in up front, so send() uses that instead of resolving
 // again (a resolve would re-read the file we just wrote — harmless, but this is
 // the same shape as the bug where a stale env var shadowed a fresh login).
@@ -290,6 +300,36 @@ function plural(n, one, many) {
   return `${n} ${n === 1 ? one : many ?? one + "s"}`;
 }
 
+// --- Cowork's second copy of every chat -------------------------------------
+//
+// Each Cowork session folder (…/local_<uuid>/) holds an audit.jsonl AND the
+// session's real transcript (inside the container's own .claude/projects/
+// tree). Both look like a chat, and they'd get two different session ids — the
+// audit log takes the folder's uuid, the transcript its own — so the server
+// couldn't tell they're the same conversation and you'd get two notes.
+//
+// Rule: inside one local_<uuid> folder, if any OTHER chat file exists, the
+// audit.jsonl is the duplicate and is left out. If audit.jsonl is the only chat
+// in that folder, it's all we have, so it stays.
+
+const COWORK_FOLDER_RE = /^(.*[\\/]local_[0-9a-f-]{36})[\\/]/i;
+
+function duplicateCoworkLogs(transcripts) {
+  // Which Cowork session folders have at least one chat that isn't audit.jsonl?
+  const hasRealTranscript = new Set();
+  for (const p of transcripts) {
+    const folder = COWORK_FOLDER_RE.exec(p)?.[1];
+    if (folder && basename(p).toLowerCase() !== "audit.jsonl") hasRealTranscript.add(folder);
+  }
+  // Every audit.jsonl in one of those folders is a duplicate.
+  const dupes = new Set();
+  for (const p of transcripts) {
+    const folder = COWORK_FOLDER_RE.exec(p)?.[1];
+    if (folder && basename(p).toLowerCase() === "audit.jsonl" && hasRealTranscript.has(folder)) dupes.add(p);
+  }
+  return dupes;
+}
+
 // --- the scan --------------------------------------------------------------
 
 async function scan() {
@@ -301,7 +341,7 @@ async function scan() {
       "  ~/Library/Application Support/Claude\n" +
       "  ~/Library/Application Support/Cowork\n\n" +
       "If your transcripts live somewhere else, point at it:\n" +
-      `  node ${ME} --path=/where/they/are\n\n`,
+      `  ${rerun("--path=/where/they/are")}\n\n`,
     );
     return [];
   }
@@ -335,10 +375,17 @@ async function scan() {
     (args.quick ? "" : ", reading them now…") + "\n",
   );
 
+  const duplicates = duplicateCoworkLogs(transcripts);
+
   const rows = [];
   for (const path of transcripts) {
     let st;
     try { st = statSync(path); } catch { continue; }
+    // A duplicate is left out later (and counted); no point reading it now.
+    if (duplicates.has(path)) {
+      rows.push({ path, size: st.size, duplicate: true });
+      continue;
+    }
     const stats = args.quick
       ? { user: null, assistant: null, first: null, last: st.mtimeMs }
       : await readStats(path);
@@ -359,8 +406,9 @@ async function scan() {
 
 function applyFilters(rows) {
   const kept = [];
-  const dropped = { thin: 0, dated: 0, named: 0, empty: 0 };
+  const dropped = { duplicate: 0, thin: 0, dated: 0, named: 0, empty: 0 };
   for (const r of rows) {
+    if (r.duplicate) { dropped.duplicate++; continue; }
     if (r.size === 0) { dropped.empty++; continue; }
     if (r.messages !== null && r.messages < MIN_MESSAGES) { dropped.thin++; continue; }
     const when = r.last ?? r.mtimeMs;
@@ -425,9 +473,10 @@ function report(kept, dropped) {
     process.stdout.write("\n");
   }
 
-  const skipped = dropped.thin + dropped.dated + dropped.named + dropped.empty + (dropped.limited ?? 0);
+  const skipped = dropped.duplicate + dropped.thin + dropped.dated + dropped.named + dropped.empty + (dropped.limited ?? 0);
   if (skipped > 0) {
     const bits = [];
+    if (dropped.duplicate) bits.push(`${plural(dropped.duplicate, "duplicate Cowork log")} (the same chat is already counted)`);
     if (dropped.thin) bits.push(`${dropped.thin} too short (under ${MIN_MESSAGES} messages)`);
     if (dropped.dated) bits.push(`${dropped.dated} outside your date range`);
     if (dropped.named) bits.push(`${dropped.named} filtered out by name`);
@@ -821,9 +870,9 @@ function rejectedMessage(auth, probe) {
       "  is either in the server's table or it isn't — it doesn't expire on a clock,\n" +
       "  so a rejection means it's the wrong string or it was never really minted.\n" +
       "  You don't need one. Sign in as yourself instead:\n" +
-      `    unset VG_BRAIN_TOKEN\n    node ${ME} --login\n`
+      `    unset VG_BRAIN_TOKEN\n    ${rerun("--login")}\n`
     : "\n  Logins expire after about a month and don't renew themselves. Sign in again:\n" +
-      `    node ${ME} --login\n`;
+      `    ${rerun("--login")}\n`;
   return head + fix + "\n  Nothing was uploaded.";
 }
 
@@ -837,7 +886,7 @@ async function whoami(pre) {
   // ago and reports it as a failure.
   const auth = pre ?? resolveToken();
   if (!auth) {
-    die(`no login found on this Mac. Run:  node ${ME} --login`);
+    die(`no login found on this Mac. Run:  ${rerun("--login")}`);
   }
   process.stdout.write(`\nChecking ${BASE}\n  Login from ${auth.from}\n  ${tokenShape(auth.token)}\n\n`);
   const r = await httpJson("GET", `${BASE}/context-header?source=whoami`, auth.token);
@@ -1012,7 +1061,7 @@ async function send(kept) {
     } else {
       die(
         "you're not signed in to VG Brain on this Mac, so there's nothing to send with.\n" +
-        `  Run:  node ${ME} --login\n` +
+        `  Run:  ${rerun("--login")}\n` +
         "  Nothing was uploaded.",
       );
     }
@@ -1050,7 +1099,7 @@ async function send(kept) {
       "worth keeping, so a pile this size takes a while and lands as a lot of notes.\n" +
       "You can do it in batches instead — this is safe to run over and over, and it\n" +
       "skips whatever already went:\n" +
-      `  node ${ME} --since=2026-07-01 --send\n\n`,
+      `  ${rerun("--since=2026-07-01 --send")}\n\n`,
     );
   }
 
@@ -1197,13 +1246,13 @@ async function main() {
     process.stdout.write(
       "Nothing has been sent. This was a look, not an upload.\n\n" +
       "When it looks right:\n" +
-      `  node ${ME} --send\n\n` +
+      `  ${rerun("--send")}\n\n` +
       "To narrow it down first:\n" +
-      `  node ${ME} --list\n` +
-      `  node ${ME} --limit=1 --send        # try one first\n` +
-      `  node ${ME} --since=2025-06-01\n` +
-      `  node ${ME} --project=acme --send\n` +
-      `  node ${ME} --exclude=scratch --send\n\n`,
+      `  ${rerun("--list")}\n` +
+      `  ${rerun("--limit=1 --send")}        # try one first\n` +
+      `  ${rerun("--since=2025-06-01")}\n` +
+      `  ${rerun("--project=acme --send")}\n` +
+      `  ${rerun("--exclude=scratch --send")}\n\n`,
     );
     return;
   }
